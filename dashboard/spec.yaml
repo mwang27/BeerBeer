@@ -1,0 +1,193 @@
+# =============================================================
+# BeerBeer Sales Overview — declarative dashboard spec
+#
+# build.py reads this file and materialises the dashboard via
+# the Superset REST API. Treating the dashboard as code means:
+#   - PRs review layout & metric changes like any other diff
+#   - dev/staging/prod stay in sync (same spec, different Superset)
+#   - secrets stay out of git (resolved from env in build.py)
+# =============================================================
+
+database:
+  name: BeerBeer Warehouse
+  # sqlalchemy_uri filled in at build time from $WAREHOUSE_URL
+  expose_in_sqllab: true
+  allow_run_async: true
+  cache_timeout: 600
+
+# --- Datasets -------------------------------------------------
+# Bind to the semantic views, not the raw fact table.
+# Define metrics ONCE here so every chart shares the same logic.
+datasets:
+  - name: v_sales
+    schema: warehouse
+    main_dttm_col: sale_date
+    description: |
+      Wide sales view (one row per date × sku × store).
+      Use as the dashboard's primary dataset.
+    cache_timeout: 1800
+    metrics:
+      - name: net_revenue
+        verbose_name: 净收入
+        expression: SUM(net_revenue)
+        d3format: "¥,.0f"
+      - name: units_sold
+        verbose_name: 销售件数
+        expression: SUM(units)
+        d3format: ",d"
+      - name: gross_profit
+        verbose_name: 毛利
+        expression: SUM(gross_profit)
+        d3format: "¥,.0f"
+      - name: gross_margin_pct
+        verbose_name: 毛利率
+        expression: SUM(gross_profit) / NULLIF(SUM(net_revenue), 0)
+        d3format: ".1%"
+      - name: avg_unit_price
+        verbose_name: 客单价
+        expression: SUM(net_revenue) / NULLIF(SUM(units), 0)
+        d3format: "¥,.2f"
+
+  - name: v_kpi_daily
+    schema: warehouse
+    main_dttm_col: sale_date
+    description: Pre-aggregated daily KPIs for trend lines.
+    cache_timeout: 1800
+
+# --- Charts ---------------------------------------------------
+# Layout principle:
+#   Row 1: KPIs (4 big numbers, period-over-period delta)
+#   Row 2: trend (full-width line)
+#   Row 3: top SKUs | style mix
+#   Row 4: region table | weekday × hour heatmap
+charts:
+  # --- KPI row ---
+  - key: kpi_revenue
+    title: 净收入 (近 30 天)
+    viz: big_number_total
+    dataset: v_sales
+    metric: net_revenue
+    time_range: "Last 30 days"
+    compare_lag: 30
+    compare_suffix: "vs 上 30 天"
+    subheader_format: "¥,.0f"
+
+  - key: kpi_units
+    title: 销售件数 (近 30 天)
+    viz: big_number_total
+    dataset: v_sales
+    metric: units_sold
+    time_range: "Last 30 days"
+    compare_lag: 30
+
+  - key: kpi_margin
+    title: 毛利率 (近 30 天)
+    viz: big_number_total
+    dataset: v_sales
+    metric: gross_margin_pct
+    time_range: "Last 30 days"
+    compare_lag: 30
+
+  - key: kpi_aup
+    title: 客单价 (近 30 天)
+    viz: big_number_total
+    dataset: v_sales
+    metric: avg_unit_price
+    time_range: "Last 30 days"
+    compare_lag: 30
+
+  # --- Trend ---
+  - key: trend_revenue
+    title: 净收入与 7 日均线
+    viz: line
+    dataset: v_kpi_daily
+    metrics: [net_revenue]
+    time_range: "Last 90 days"
+    rolling_type: mean
+    rolling_periods: 7
+    show_legend: true
+    annotations:
+      - label: 周末
+        type: event
+        rule: weekend
+
+  # --- Breakdowns ---
+  - key: top_skus
+    title: Top 10 SKU(按净收入)
+    viz: bar
+    dataset: v_sales
+    metric: net_revenue
+    groupby: [beer_name, package_ml]
+    row_limit: 10
+    time_range: "Last 30 days"
+    order_desc: true
+
+  - key: style_mix
+    title: 风格销售占比
+    viz: pie
+    dataset: v_sales
+    metric: net_revenue
+    groupby: [style]
+    time_range: "Last 30 days"
+    donut: true
+    label_type: key_percent
+
+  - key: region_table
+    title: 区域 × 渠道
+    viz: pivot_table_v2
+    dataset: v_sales
+    metrics: [net_revenue, units_sold, gross_margin_pct]
+    rows: [region]
+    columns: [channel]
+    time_range: "Last 30 days"
+    row_totals: true
+    col_totals: true
+
+  - key: heatmap_dow
+    title: 星期 × 周次销售热力
+    viz: heatmap
+    dataset: v_sales
+    metric: net_revenue
+    x_axis: week_of_year
+    y_axis: day_name
+    time_range: "Last 90 days"
+    color_scheme: blue_white_yellow
+
+# --- Native filters (dashboard-level) -------------------------
+# High-cardinality fields go in native filters; low-cardinality
+# slicing relies on cross-filters from the charts themselves.
+filters:
+  - name: 日期范围
+    type: time_range
+    default: "Last 30 days"
+  - name: 区域
+    type: filter_select
+    column: region
+    multiple: true
+  - name: 渠道
+    type: filter_select
+    column: channel
+    multiple: true
+  - name: 风格
+    type: filter_select
+    column: style
+    multiple: true
+
+# --- Dashboard ------------------------------------------------
+dashboard:
+  title: BeerBeer 销售总览
+  slug: beer-sales-overview
+  color_scheme: beerbeerBrand
+  cross_filters_enabled: true
+  refresh_frequency_sec: 0           # manual; set 300 for live wall
+  layout:
+    - row: [kpi_revenue, kpi_units, kpi_margin, kpi_aup]
+    - row: [trend_revenue]
+    - row: [top_skus, style_mix]
+    - row: [region_table, heatmap_dow]
+  # Markdown header pinned at the top, documents what the
+  # viewer is looking at and where the data comes from.
+  header_md: |
+    # 🍺 BeerBeer 销售总览
+    数据源:`warehouse.v_sales`(每日 04:00 ETL)。指标定义见
+    [指标字典](/superset/databaseview/list/) 中 `v_sales` 数据集。
